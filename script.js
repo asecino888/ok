@@ -11,19 +11,22 @@ const hint = document.getElementById('hint');
 const layerA = document.getElementById('layerA');
 const layerB = document.getElementById('layerB');
 
-const imageSlots = {
-  0: null,
-  1: null,
-  2: null,
-  3: null,
-  4: null,
+const imageSlots = { 0: null, 1: null, 2: null, 3: null, 4: null };
+const defaultImagePaths = {
+  0: 'assets/images/0_dark.png',
+  1: 'assets/images/1_low_glow.png',
+  2: 'assets/images/2_mid_glow.png',
+  3: 'assets/images/3_high_glow.png',
+  4: 'assets/images/4_lightning.png',
 };
 
 let audioContext;
 let analyser;
 let sourceNode;
 let timeData;
-let rafId;
+let freqData;
+let rafId = null;
+let audioObjectUrl = null;
 
 let currentLevel = -1;
 let activeLayer = layerA;
@@ -32,6 +35,7 @@ let inactiveLayer = layerB;
 let isBeatFlash = false;
 let beatFlashUntil = 0;
 let rollingEnergy = 0;
+let rollingBassEnergy = 0;
 let rollingReadyFrames = 0;
 
 const FILE_LEVEL_PATTERN = /^(0|1|2|3|4)_.*\.(png|jpg|jpeg|webp)$/i;
@@ -50,24 +54,39 @@ function updateSliderText() {
 }
 
 function initAudioGraph() {
-  if (!audioContext) {
-    audioContext = new AudioContext();
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 2048;
-    analyser.smoothingTimeConstant = 0.75;
-    timeData = new Uint8Array(analyser.fftSize);
+  if (audioContext) return;
 
-    sourceNode = audioContext.createMediaElementSource(audioEl);
-    sourceNode.connect(analyser);
-    analyser.connect(audioContext.destination);
-  }
+  audioContext = new AudioContext();
+  analyser = audioContext.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.72;
+
+  timeData = new Uint8Array(analyser.fftSize);
+  freqData = new Uint8Array(analyser.frequencyBinCount);
+
+  sourceNode = audioContext.createMediaElementSource(audioEl);
+  sourceNode.connect(analyser);
+  analyser.connect(audioContext.destination);
+}
+
+function stopAnimationLoop() {
+  if (!rafId) return;
+  cancelAnimationFrame(rafId);
+  rafId = null;
+}
+
+function startAnimationLoop() {
+  if (rafId) return;
+  rafId = requestAnimationFrame(animate);
 }
 
 function loadAudio(file) {
   if (!file) return;
 
-  const url = URL.createObjectURL(file);
-  audioEl.src = url;
+  if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
+  audioObjectUrl = URL.createObjectURL(file);
+
+  audioEl.src = audioObjectUrl;
   audioEl.load();
 
   playPauseBtn.disabled = false;
@@ -75,19 +94,59 @@ function loadAudio(file) {
   setStatus(`已載入音樂：${file.name}`);
 }
 
-function clearOldImages() {
+function clearObjectUrls() {
   Object.values(imageSlots).forEach((url) => {
-    if (url) URL.revokeObjectURL(url);
+    if (url && url.startsWith('blob:')) URL.revokeObjectURL(url);
   });
   Object.keys(imageSlots).forEach((k) => {
     imageSlots[k] = null;
   });
 }
 
+async function canLoadImage(url) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(true);
+    img.onerror = () => resolve(false);
+    img.src = url;
+  });
+}
+
+async function tryLoadDefaultImages() {
+  let loaded = 0;
+  for (let level = 0; level <= 4; level += 1) {
+    const url = defaultImagePaths[level];
+    // eslint-disable-next-line no-await-in-loop
+    const ok = await canLoadImage(url);
+    if (ok) {
+      imageSlots[level] = url;
+      loaded += 1;
+    }
+  }
+
+  if (loaded > 0) {
+    showInitialImage();
+    setHint('已載入預設圖片，播放時會依音量與重音切換');
+    setStatus(`已自動載入預設圖片 ${loaded} 張（assets/images）。`);
+  }
+}
+
+function showInitialImage() {
+  const base = imageSlots[0] ?? imageSlots[1] ?? imageSlots[2] ?? imageSlots[3] ?? imageSlots[4];
+  if (!base) return;
+
+  layerA.src = base;
+  layerA.classList.add('active');
+  layerB.classList.remove('active');
+  activeLayer = layerA;
+  inactiveLayer = layerB;
+  currentLevel = -1;
+}
+
 function loadImages(files) {
   if (!files.length) return;
 
-  clearOldImages();
+  clearObjectUrls();
   let loadedCount = 0;
 
   [...files].forEach((file) => {
@@ -104,15 +163,7 @@ function loadImages(files) {
     return;
   }
 
-  const base = imageSlots[0] ?? imageSlots[1] ?? imageSlots[2] ?? imageSlots[3] ?? imageSlots[4];
-  if (base) {
-    layerA.src = base;
-    layerA.classList.add('active');
-    layerB.classList.remove('active');
-    activeLayer = layerA;
-    inactiveLayer = layerB;
-  }
-
+  showInitialImage();
   setHint('播放時會根據音量與重音切換亮度');
   setStatus(`已載入圖片 ${loadedCount} 張（符合命名規則）。`);
 }
@@ -129,35 +180,52 @@ function computeRmsLevel() {
   return Math.sqrt(sumSquares / timeData.length);
 }
 
-function chooseLevel(rms, nowMs) {
+function computeBassEnergy() {
+  analyser.getByteFrequencyData(freqData);
+
+  const nyquist = (audioContext?.sampleRate ?? 48000) / 2;
+  const hzPerBin = nyquist / freqData.length;
+  const maxBassHz = 180;
+  const bassBins = Math.max(1, Math.floor(maxBassHz / hzPerBin));
+
+  let sum = 0;
+  for (let i = 0; i < bassBins; i += 1) sum += freqData[i];
+
+  return sum / bassBins / 255;
+}
+
+function chooseLevel(rms, bass, nowMs) {
   const sensitivity = Number(sensitivityRange.value);
   const lightningThreshold = Number(lightningThresholdRange.value);
-  const energy = rms * sensitivity;
 
-  rollingEnergy = rollingEnergy * 0.92 + energy * 0.08;
+  const energy = rms * sensitivity;
+  const weightedEnergy = energy * 0.75 + bass * 0.25;
+
+  rollingEnergy = rollingEnergy * 0.92 + weightedEnergy * 0.08;
+  rollingBassEnergy = rollingBassEnergy * 0.9 + bass * 0.1;
   rollingReadyFrames = Math.min(rollingReadyFrames + 1, 9999);
 
-  const beatRatio = rollingEnergy > 0 ? energy / rollingEnergy : 0;
-  const beatDetected = rollingReadyFrames > 30 && beatRatio > lightningThreshold && energy > 0.07;
+  const beatRatio = rollingEnergy > 0 ? weightedEnergy / rollingEnergy : 0;
+  const bassRatio = rollingBassEnergy > 0 ? bass / rollingBassEnergy : 0;
 
-  if (beatDetected) {
+  const beatDetected =
+    rollingReadyFrames > 24 &&
+    beatRatio > lightningThreshold &&
+    bassRatio > Math.max(1.12, lightningThreshold * 0.7) &&
+    weightedEnergy > 0.06;
+
+  if (beatDetected && imageSlots[4]) {
     isBeatFlash = true;
     beatFlashUntil = nowMs + 120;
   }
 
-  if (isBeatFlash && nowMs <= beatFlashUntil && imageSlots[4]) {
-    return 4;
-  }
+  if (isBeatFlash && nowMs <= beatFlashUntil && imageSlots[4]) return 4;
+  if (nowMs > beatFlashUntil) isBeatFlash = false;
 
-  if (nowMs > beatFlashUntil) {
-    isBeatFlash = false;
-  }
-
-  if (energy < 0.03) return 0;
-  if (energy < 0.06) return 1;
-  if (energy < 0.11) return 2;
-  if (energy < 0.17) return 3;
-  return imageSlots[4] ? 3 : 3;
+  if (weightedEnergy < 0.03) return 0;
+  if (weightedEnergy < 0.06) return 1;
+  if (weightedEnergy < 0.11) return 2;
+  return 3;
 }
 
 function resolveImageForLevel(level) {
@@ -186,7 +254,8 @@ function crossfadeTo(url) {
 function animate() {
   const now = performance.now();
   const rms = computeRmsLevel();
-  const level = chooseLevel(rms, now);
+  const bass = computeBassEnergy();
+  const level = chooseLevel(rms, bass, now);
 
   if (level !== currentLevel) {
     const image = resolveImageForLevel(level);
@@ -194,7 +263,11 @@ function animate() {
     currentLevel = level;
   }
 
-  rafId = requestAnimationFrame(animate);
+  if (!audioEl.paused && !audioEl.ended) {
+    rafId = requestAnimationFrame(animate);
+  } else {
+    rafId = null;
+  }
 }
 
 async function togglePlayback() {
@@ -213,17 +286,28 @@ async function togglePlayback() {
     await audioEl.play();
     playPauseBtn.textContent = '暫停';
     setStatus('播放中…');
-    if (!rafId) rafId = requestAnimationFrame(animate);
+    startAnimationLoop();
   } else {
     audioEl.pause();
     playPauseBtn.textContent = '播放';
     setStatus('已暫停。');
+    stopAnimationLoop();
   }
 }
+
+audioEl.addEventListener('play', () => {
+  startAnimationLoop();
+});
+
+audioEl.addEventListener('pause', () => {
+  playPauseBtn.textContent = '播放';
+  stopAnimationLoop();
+});
 
 audioEl.addEventListener('ended', () => {
   playPauseBtn.textContent = '播放';
   setStatus('播放結束。');
+  stopAnimationLoop();
 });
 
 audioFileInput.addEventListener('change', (event) => {
@@ -242,5 +326,10 @@ playPauseBtn.addEventListener('click', () => {
 
 sensitivityRange.addEventListener('input', updateSliderText);
 lightningThresholdRange.addEventListener('input', updateSliderText);
+window.addEventListener('beforeunload', () => {
+  clearObjectUrls();
+  if (audioObjectUrl) URL.revokeObjectURL(audioObjectUrl);
+});
 
 updateSliderText();
+tryLoadDefaultImages();
